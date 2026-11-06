@@ -454,25 +454,41 @@ Languages:
         if self._total_contributions is not None:
             return self._total_contributions
 
-        self._total_contributions = 0
-        years = (
-            (await self.queries.query(Queries.contrib_years()))
-            .get("data", {})
-            .get("viewer", {})
-            .get("contributionsCollection", {})
-            .get("contributionYears", [])
-        )
-        by_year = (
-            (await self.queries.query(Queries.all_contribs(years)))
-            .get("data", {})
-            .get("viewer", {})
-            .values()
-        )
-        for year in by_year:
-            self._total_contributions += year.get("contributionCalendar", {}).get(
-                "totalContributions", 0
+        async def query_with_retries(query: str, what: str) -> Dict:
+            # Querying GitHub GraphQL API sometimes fails (e.g. with 502 error
+            # when the query takes too long), so retry a few times and give up
+            # with an error rather than silently returning wrong results.
+            max_attempts = 5
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    result = await self.queries.query(query)
+                    data = result.get("data")
+                    if data and not result.get("errors"):
+                        return data
+                    print(f"Querying {what} failed: {result.get('errors')}")
+                except Exception as e:
+                    print(f"Querying {what} failed: {e!r}")
+                if attempt < max_attempts:
+                    await asyncio.sleep(2 * attempt)
+            raise RuntimeError(
+                f"Querying {what} failed after {max_attempts} attempts"
             )
-        return cast(int, self._total_contributions)
+
+        years = (
+            await query_with_retries(Queries.contrib_years(), "contribution years")
+        )["viewer"]["contributionsCollection"]["contributionYears"]
+
+        # Query each year separately: getting all of them at once is too slow
+        # for users with many contribution years and often times out.
+        total = 0
+        for year in years:
+            data = await query_with_retries(
+                Queries.all_contribs([year]), f"contributions for {year}"
+            )
+            for by_year in data["viewer"].values():
+                total += by_year["contributionCalendar"]["totalContributions"]
+        self._total_contributions = total
+        return total
 
     @property
     async def lines_changed(self) -> Tuple[int, int]:
